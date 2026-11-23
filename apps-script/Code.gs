@@ -2,7 +2,8 @@
  * 수행평가 제출함 — Google Apps Script 백엔드
  *
  * 기준 폴더(CONFIG.ROOT_FOLDER_ID) 안의 하위 폴더 1개 = 수행평가 1개.
- * 학생 파일은 '학번_이름.확장자'로 해당 폴더에 저장되고, 모든 제출은 '수행평가 제출기록' 시트에 남습니다.
+ * 학생 파일은 '수행평가 폴더 › 2학년 3반 › 학번_이름.확장자'처럼 학번에서 읽은 학년·반 폴더에 저장되고,
+ * 모든 제출은 '수행평가 제출기록' 시트에 남습니다.
  * 관리자 페이지에서 수행평가를 만들면 하위 폴더가 생기고 바로 학생 화면에 나타납니다.
  * 드라이브에서 직접 만든 폴더는 관리자 페이지에서 '다시 열기'를 눌러야 학생에게 보입니다.
  */
@@ -14,6 +15,7 @@ const CONFIG = {
   MAX_FILE_MB: 2048,                   // 파일 1개 최대 용량 (MB). 학생 브라우저가 드라이브로 직접 올리므로 영상도 가능
   MAX_FILES: 5,                        // 한 번에 올릴 수 있는 파일 수
   STUDENT_ID_PATTERN: /^\d{4,6}$/,     // 학번 형식 (예: 10101, 30215)
+  NUMBER_DIGITS: 2,                    // 학번 맨 뒤 번호 자릿수. 첫 자리=학년, 그 사이=반 (20315 → 2학년 3반 15번)
   NAME_PATTERN: /^[가-힣a-zA-Z]{1,20}$/,
   OVERWRITE_ON_RESUBMIT: true,         // 재제출 시 같은 학번_이름의 이전 파일을 휴지통으로 이동
   LOG_SHEET_NAME: '수행평가 제출기록',
@@ -85,7 +87,32 @@ function checkStudent_(d) {
   const name = String(d.name || '').replace(/\s+/g, '');
   if (!CONFIG.STUDENT_ID_PATTERN.test(studentId)) throw new Error('학번 형식이 올바르지 않습니다.');
   if (!CONFIG.NAME_PATTERN.test(name)) throw new Error('이름은 한글 또는 영문으로만 입력하세요.');
-  return { studentId, name, base: studentId + '_' + name };
+  const cls = classOf_(studentId);
+  if (!cls) throw new Error('학번에서 학년·반을 읽을 수 없습니다. 학번을 다시 확인하세요.');
+  return { studentId, name, base: studentId + '_' + name, cls: cls };
+}
+
+// 학번 → 학년·반 (첫 자리 = 학년, 끝 NUMBER_DIGITS자리 = 번호, 그 사이 = 반)
+function classOf_(studentId) {
+  const s = String(studentId || '');
+  const nd = CONFIG.NUMBER_DIGITS;
+  if (!/^\d+$/.test(s) || s.length < nd + 2) return null;
+  const grade = Number(s[0]);
+  const cls = Number(s.slice(1, s.length - nd));
+  if (!grade || !cls) return null;
+  return { grade: grade, cls: cls, label: grade + '학년 ' + cls + '반' };
+}
+
+// 수행평가 폴더 안의 'N학년 N반' 폴더 (없으면 만듦)
+function getClassFolder_(folder, label) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const it = folder.getFoldersByName(label);
+    return it.hasNext() ? it.next() : folder.createFolder(label);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function startUpload_(d) {
@@ -101,6 +128,7 @@ function startUpload_(d) {
 
   const folder = getAssignmentFolder_(d.assignmentId);
   if (!isAccepting_(readMeta_(folder))) throw new Error('제출이 마감된 수행평가입니다.');
+  const target = getClassFolder_(folder, st.cls.label);
 
   const token = ScriptApp.getOAuthToken();
   const origin = String(d.origin || '');
@@ -117,7 +145,7 @@ function startUpload_(d) {
       method: 'post',
       contentType: 'application/json; charset=UTF-8',
       headers: headers,
-      payload: JSON.stringify({ name: fileName, parents: [folder.getId()], mimeType: mimeType }),
+      payload: JSON.stringify({ name: fileName, parents: [target.getId()], mimeType: mimeType }),
       muteHttpExceptions: true,
     });
     if (res.getResponseCode() !== 200) throw new Error('업로드 준비에 실패했습니다. (' + res.getResponseCode() + ')');
@@ -126,7 +154,7 @@ function startUpload_(d) {
     if (!url) throw new Error('업로드 주소를 받지 못했습니다.');
     return { fileName: fileName, uploadUrl: url };
   });
-  return { uploads: uploads, maxFileMb: CONFIG.MAX_FILE_MB };
+  return { uploads: uploads, classLabel: st.cls.label, maxFileMb: CONFIG.MAX_FILE_MB };
 }
 
 function finishUpload_(d) {
@@ -134,7 +162,8 @@ function finishUpload_(d) {
   const ids = Array.isArray(d.fileIds) ? d.fileIds.map(String) : [];
   if (ids.length === 0) throw new Error('업로드된 파일이 없습니다.');
   const folder = getAssignmentFolder_(d.assignmentId);
-  const folderId = folder.getId();
+  const target = getClassFolder_(folder, st.cls.label);
+  const folderId = target.getId();
 
   const saved = ids.map(id => {
     const f = DriveApp.getFileById(id);
@@ -151,13 +180,15 @@ function finishUpload_(d) {
     if (CONFIG.OVERWRITE_ON_RESUBMIT) {
       const keep = {};
       ids.forEach(id => (keep[id] = true));
-      const it = folder.getFiles();
-      while (it.hasNext()) {
-        const f = it.next();
-        const n = f.getName();
-        if (keep[f.getId()]) continue;
-        if (n === st.base || n.indexOf(st.base + '.') === 0 || n.indexOf(st.base + '_') === 0) f.setTrashed(true);
-      }
+      [target, folder].forEach(dir => { // 반 폴더 + (예전 방식으로 저장된) 수행평가 폴더 바로 아래
+        const it = dir.getFiles();
+        while (it.hasNext()) {
+          const f = it.next();
+          const n = f.getName();
+          if (keep[f.getId()]) continue;
+          if (n === st.base || n.indexOf(st.base + '.') === 0 || n.indexOf(st.base + '_') === 0) f.setTrashed(true);
+        }
+      });
     }
   } finally {
     lock.releaseLock();
@@ -166,11 +197,11 @@ function finishUpload_(d) {
   try {
     const sheet = getLogSheet_();
     const now = new Date();
-    saved.forEach(f => sheet.appendRow([now, folder.getName(), "'" + st.studentId, st.name, f.getName(), f.getUrl()]));
+    saved.forEach(f => sheet.appendRow([now, folder.getName(), st.cls.label, "'" + st.studentId, st.name, f.getName(), f.getUrl()]));
   } catch (err) {
     console.warn('로그 기록 실패: ' + err);
   }
-  return { saved: saved.map(f => f.getName()), assignment: folder.getName() };
+  return { saved: saved.map(f => f.getName()), assignment: folder.getName(), classLabel: st.cls.label };
 }
 
 function extOf_(fileName) {
@@ -223,21 +254,31 @@ function updateAssignment_(d) {
 
 function listSubmissions_(assignmentId) {
   const folder = getAssignmentFolder_(assignmentId);
-  const it = folder.getFiles();
   const out = [];
-  while (it.hasNext()) {
-    const f = it.next();
+  const add = (f, folderLabel) => {
     const m = f.getName().match(/^(\d+)_([^_.]+)/);
+    const cls = m ? classOf_(m[1]) : null;
     out.push({
       fileName: f.getName(),
       studentId: m ? m[1] : '',
       studentName: m ? m[2] : '',
+      classLabel: folderLabel || (cls ? cls.label : '분류 안 됨'),
+      grade: cls ? cls.grade : 99,
+      cls: cls ? cls.cls : 99,
       updated: f.getLastUpdated().toISOString(),
       size: f.getSize(),
       url: f.getUrl(),
     });
+  };
+  const files = folder.getFiles();
+  while (files.hasNext()) add(files.next(), '');
+  const dirs = folder.getFolders();
+  while (dirs.hasNext()) {
+    const dir = dirs.next();
+    const it = dir.getFiles();
+    while (it.hasNext()) add(it.next(), dir.getName());
   }
-  out.sort((a, b) => a.studentId.localeCompare(b.studentId) || a.fileName.localeCompare(b.fileName));
+  out.sort((a, b) => a.grade - b.grade || a.cls - b.cls || a.studentId.localeCompare(b.studentId) || a.fileName.localeCompare(b.fileName));
   return out;
 }
 
@@ -281,6 +322,11 @@ function countFiles_(folder) {
   let n = 0;
   const it = folder.getFiles();
   while (it.hasNext()) { it.next(); n++; }
+  const dirs = folder.getFolders();
+  while (dirs.hasNext()) {
+    const fi = dirs.next().getFiles();
+    while (fi.hasNext()) { fi.next(); n++; }
+  }
   return n;
 }
 
@@ -334,8 +380,39 @@ function getLogSheet_() {
     DriveApp.getFileById(ss.getId()).moveTo(getRoot_(true));
     PROPS.setProperty('LOG_SHEET_ID', ss.getId());
     const sh = ss.getSheets()[0];
-    sh.appendRow(['제출시각', '수행평가', '학번', '이름', '파일명', '파일 링크']);
+    sh.appendRow(['제출시각', '수행평가', '학년반', '학번', '이름', '파일명', '파일 링크']);
     sh.setFrozenRows(1);
   }
-  return ss.getSheets()[0];
+  const sheet = ss.getSheets()[0];
+  if (sheet.getRange(1, 3).getValue() !== '학년반') { // 예전 시트에 '학년반' 열 추가
+    sheet.insertColumnBefore(3);
+    sheet.getRange(1, 3).setValue('학년반');
+  }
+  return sheet;
+}
+
+/**
+ * (한 번만 실행) 반별 분류 이전에 수행평가 폴더 바로 아래 저장된 파일을 'N학년 N반' 폴더로 옮깁니다.
+ * 이 앱으로 만든 수행평가 폴더만 정리하고, 드라이브에서 직접 만든 폴더는 건드리지 않습니다.
+ */
+function organizeExistingFiles() {
+  const dirs = getRoot_(false).getFolders();
+  let moved = 0;
+  while (dirs.hasNext()) {
+    const a = dirs.next();
+    let managed = false;
+    try { managed = typeof JSON.parse(a.getDescription() || '') === 'object'; } catch (e) { managed = false; }
+    if (!managed) continue;
+    const it = a.getFiles();
+    while (it.hasNext()) {
+      const f = it.next();
+      const m = f.getName().match(/^(\d+)_/);
+      const c = m ? classOf_(m[1]) : null;
+      if (!c) continue;
+      f.moveTo(getClassFolder_(a, c.label));
+      moved++;
+    }
+  }
+  getLogSheet_(); // 제출기록 시트에 '학년반' 열이 없으면 추가
+  Logger.log(moved + '개 파일을 학년·반 폴더로 옮겼습니다.');
 }
