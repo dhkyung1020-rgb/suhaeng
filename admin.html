@@ -77,15 +77,19 @@
   </dialog>
 
   <!-- 제출 현황 -->
-  <dialog id="filesDlg">
+  <dialog id="filesDlg" style="width:min(760px,94vw)">
     <div class="dh"><h3 id="filesTitle">제출 현황</h3><button type="button" class="sm" data-close>닫기</button></div>
     <div class="db">
+      <div class="field" id="classFilterWrap" style="display:none">
+        <label for="classFilter">학급</label>
+        <select id="classFilter"></select>
+      </div>
       <div id="filesBody"></div>
       <details style="margin-top:18px">
         <summary style="cursor:pointer;font-weight:600">미제출자 확인하기</summary>
         <div class="field" style="margin-top:10px">
-          <textarea id="roster" rows="5" placeholder="반 학번 목록을 붙여넣으세요 (줄바꿈·쉼표·공백으로 구분)&#10;예: 10101 10102 10103"></textarea>
-          <div class="hint">입력한 목록은 이 브라우저에만 저장됩니다.</div>
+          <textarea id="roster" rows="5" placeholder="학번 목록을 붙여넣으세요 (줄바꿈·쉼표·공백으로 구분, 여러 반을 한꺼번에 넣어도 됩니다)&#10;예: 20301 20302 20303"></textarea>
+          <div class="hint">위에서 고른 학급 기준으로 보여 줍니다. 입력한 목록은 이 브라우저에만 저장됩니다.</div>
         </div>
         <div id="missing"></div>
       </details>
@@ -93,8 +97,8 @@
     <div class="df"><a class="btn" id="filesDriveLink" target="_blank" rel="noopener">드라이브에서 열기</a></div>
   </dialog>
 
-  <script src="config.js?v=2"></script>
-  <script src="common.js?v=2"></script>
+  <script src="config.js?v=3"></script>
+  <script src="common.js?v=3"></script>
   <script>
     let password = sessionStorage.getItem('adminPw') || '';
     let assignments = [];
@@ -233,38 +237,67 @@
       $('#filesTitle').textContent = a.name + ' · 제출 현황';
       $('#filesDriveLink').href = a.url;
       $('#filesBody').innerHTML = '<div class="empty">불러오는 중…</div>';
+      $('#classFilterWrap').style.display = 'none';
       $('#missing').innerHTML = '';
       $('#roster').value = localStorage.getItem('roster') || '';
       $('#filesDlg').showModal();
       try {
         const data = await admin('admin.files', { assignmentId: a.id });
         currentFiles = data.files;
-        const ids = new Set(currentFiles.map(f => f.studentId).filter(Boolean));
-        $('#filesBody').innerHTML = currentFiles.length === 0
-          ? '<div class="empty">아직 제출한 학생이 없습니다.</div>'
-          : `<p class="hint" style="margin-top:0">제출 학생 <b>${ids.size}명</b> · 파일 ${currentFiles.length}개</p>
-             <div class="table-wrap"><table><thead><tr><th>학번</th><th>이름</th><th>파일</th><th>제출 시각</th></tr></thead><tbody>
-             ${currentFiles.map(f => `<tr><td>${esc(f.studentId)}</td><td>${esc(f.studentName)}</td>
-               <td><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.fileName)}</a> <span class="hint">${fmtSize(f.size)}</span></td>
-               <td>${esc(fmtDate(f.updated))}</td></tr>`).join('')}
-             </tbody></table></div>`;
-        checkMissing();
+        buildClassFilter();
+        renderFiles();
       } catch (err) {
         $('#filesBody').innerHTML = `<div class="alert">${esc(err.message)}</div>`;
       }
     }
 
+    function rosterIds() {
+      return [...new Set($('#roster').value.split(/[\s,]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s)))];
+    }
+
+    function buildClassFilter() {
+      const labels = new Set(currentFiles.map(f => f.classLabel));
+      rosterIds().forEach(id => { const c = classLabelOf(id); if (c) labels.add(c); });
+      const sorted = [...labels].sort((x, y) => classSortKey(x) - classSortKey(y));
+      const prev = $('#classFilter').value;
+      const studentsIn = lab => new Set(currentFiles.filter(f => !lab || f.classLabel === lab).map(f => f.studentId)).size;
+      $('#classFilter').innerHTML = `<option value="">전체 (${studentsIn('')}명 제출)</option>` +
+        sorted.map(l => `<option value="${esc(l)}">${esc(l)} (${studentsIn(l)}명 제출)</option>`).join('');
+      if (sorted.includes(prev)) $('#classFilter').value = prev;
+      $('#classFilterWrap').style.display = sorted.length ? '' : 'none';
+    }
+
+    function renderFiles() {
+      const lab = $('#classFilter').value;
+      const list = currentFiles.filter(f => !lab || f.classLabel === lab);
+      const ids = new Set(list.map(f => f.studentId).filter(Boolean));
+      $('#filesBody').innerHTML = list.length === 0
+        ? '<div class="empty">아직 제출한 학생이 없습니다.</div>'
+        : `<p class="hint" style="margin-top:0">${lab ? esc(lab) + ' · ' : ''}제출 학생 <b>${ids.size}명</b> · 파일 ${list.length}개</p>
+           <div class="table-wrap"><table><thead><tr><th>학급</th><th>학번</th><th>이름</th><th>파일</th><th>제출 시각</th></tr></thead><tbody>
+           ${list.map(f => `<tr><td>${esc(f.classLabel)}</td><td>${esc(f.studentId)}</td><td>${esc(f.studentName)}</td>
+             <td><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.fileName)}</a> <span class="hint">${fmtSize(f.size)}</span></td>
+             <td>${esc(fmtDate(f.updated))}</td></tr>`).join('')}
+           </tbody></table></div>`;
+      checkMissing();
+    }
+
     function checkMissing() {
-      const raw = $('#roster').value;
-      localStorage.setItem('roster', raw);
-      const roster = [...new Set(raw.split(/[\s,]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s)))];
+      localStorage.setItem('roster', $('#roster').value);
+      const lab = $('#classFilter').value;
+      const roster = rosterIds().filter(id => !lab || classLabelOf(id) === lab);
       if (roster.length === 0) { $('#missing').innerHTML = ''; return; }
       const submitted = new Set(currentFiles.map(f => f.studentId));
       const missing = roster.filter(id => !submitted.has(id));
-      $('#missing').innerHTML = missing.length === 0
-        ? '<div class="preview">🎉 명단의 모든 학생이 제출했습니다.</div>'
-        : `<div class="alert">미제출 ${missing.length}명 / ${roster.length}명<br><b>${missing.join(', ')}</b></div>`;
+      if (missing.length === 0) { $('#missing').innerHTML = '<div class="preview">🎉 명단의 모든 학생이 제출했습니다.</div>'; return; }
+      const byClass = {};
+      missing.forEach(id => { const c = classLabelOf(id) || '학급 미상'; (byClass[c] = byClass[c] || []).push(id); });
+      const lines = Object.keys(byClass).sort((x, y) => classSortKey(x) - classSortKey(y))
+        .map(c => `<div style="margin-top:6px"><b>${esc(c)}</b> (${byClass[c].length}명): ${byClass[c].join(', ')}</div>`).join('');
+      $('#missing').innerHTML = `<div class="alert">미제출 ${missing.length}명 / 명단 ${roster.length}명${lines}</div>`;
     }
+    $('#classFilter').addEventListener('change', renderFiles);
+    $('#roster').addEventListener('change', buildClassFilter);
     $('#roster').addEventListener('input', checkMissing);
 
     document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));

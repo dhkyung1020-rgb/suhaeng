@@ -31,6 +31,20 @@ async function parse(res) {
   return data;
 }
 
+// 학번 → '2학년 3반' (첫 자리 = 학년, 끝 2자리 = 번호, 그 사이 = 반). Code.gs의 classOf_와 같은 규칙
+function classLabelOf(studentId) {
+  const s = String(studentId || '');
+  const nd = CFG.NUMBER_DIGITS || 2;
+  if (!/^\d+$/.test(s) || s.length < nd + 2) return '';
+  const grade = Number(s[0]);
+  const cls = Number(s.slice(1, s.length - nd));
+  return grade && cls ? `${grade}학년 ${cls}반` : '';
+}
+function classSortKey(label) {
+  const m = String(label).match(/(\d+)학년 (\d+)반/);
+  return m ? Number(m[1]) * 1000 + Number(m[2]) : 999999;
+}
+
 function $(sel, root) { return (root || document).querySelector(sel); }
 
 function esc(s) {

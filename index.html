@@ -67,8 +67,8 @@
     <footer><a href="admin.html">선생님 관리 페이지</a></footer>
   </div>
 
-  <script src="config.js?v=2"></script>
-  <script src="common.js?v=2"></script>
+  <script src="config.js?v=3"></script>
+  <script src="common.js?v=3"></script>
   <script>
     const MAX_FILES = CFG.MAX_FILES || 5;
     const MAX_FILE_MB = CFG.MAX_FILE_MB || 2048;
@@ -132,7 +132,8 @@
         const ext = m ? '.' + m[1].toLowerCase() : '';
         return `${sid}_${nm}${files.length > 1 ? '_' + (i + 1) : ''}${ext}`;
       });
-      box.innerHTML = '이렇게 저장됩니다: ' + names.map(n => `<code>${esc(n)}</code>`).join(', ');
+      const cls = classLabelOf(sid);
+      box.innerHTML = (cls ? `<b>${esc(cls)}</b> 폴더에 ` : '') + '이렇게 저장됩니다: ' + names.map(n => `<code>${esc(n)}</code>`).join(', ');
       box.classList.remove('hidden');
     }
 
@@ -213,9 +214,10 @@
       const a = assignments.find(x => x.id === sel.value);
       if (!a) return toast('수행평가를 골라 주세요.', 'error');
       if (!/^\d{4,6}$/.test(sid)) return toast('학번은 숫자 4~6자리로 입력하세요.', 'error');
+      if (!classLabelOf(sid)) return toast('학번에서 학년·반을 읽을 수 없어요. 학번을 다시 확인하세요.', 'error');
       if (!/^[가-힣a-zA-Z]{1,20}$/.test(nm)) return toast('이름은 한글 또는 영문으로만 입력하세요.', 'error');
       if (files.length === 0) return toast('제출할 파일을 첨부하세요.', 'error');
-      if (!confirm(`[${a.name}]\n학번 ${sid} / 이름 ${nm}\n\n이 정보로 제출할까요?`)) return;
+      if (!confirm(`[${a.name}]\n${classLabelOf(sid)} · 학번 ${sid} / 이름 ${nm}\n\n이 정보로 제출할까요?`)) return;
 
       const btn = $('#submitBtn');
       btn.disabled = true;
@@ -240,7 +242,7 @@
         }
         showProgress(total, total, '마무리 중');
         const res = await apiPost(Object.assign({ action: 'upload.finish', fileIds: ids }, base));
-        $('#doneMsg').textContent = `${res.assignment} · ${sid} ${nm}`;
+        $('#doneMsg').textContent = `${res.assignment} · ${res.classLabel || ''} · ${sid} ${nm}`;
         $('#doneFiles').innerHTML = res.saved.map(n => `<li><span class="n">📁 ${esc(n)}</span></li>`).join('');
         $('#form').classList.add('hidden');
         $('#done').classList.remove('hidden');

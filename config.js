@@ -4,4 +4,5 @@ window.APP_CONFIG = {
   TITLE: '2026 기술가정 수행평가 제출',
   MAX_FILE_MB: 2048, // 파일 1개 최대 용량. Code.gs의 CONFIG.MAX_FILE_MB와 맞추세요
   MAX_FILES: 5,     // Code.gs의 CONFIG.MAX_FILES와 맞추세요
+  NUMBER_DIGITS: 2, // 학번 끝 번호 자릿수 (20315 → 2학년 3반 15번). Code.gs와 맞추세요
 };
