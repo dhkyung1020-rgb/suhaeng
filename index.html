@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>수행평가 제출함</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="student">
+  <div class="wrap">
+    <header class="top">
+      <h1 data-title>수행평가 제출함</h1>
+      <p>학번과 이름을 쓰고 결과물 파일을 올려 주세요.</p>
+    </header>
+
+    <div id="setupAlert" class="alert hidden">config.js에 Apps Script 웹 앱 URL이 아직 설정되지 않았습니다.</div>
+
+    <form id="form" class="card" autocomplete="off">
+      <div class="field">
+        <label for="assignment">수행평가</label>
+        <select id="assignment" required>
+          <option value="">불러오는 중…</option>
+        </select>
+        <div id="assignmentInfo"></div>
+      </div>
+
+      <div class="grid2">
+        <div class="field">
+          <label for="studentId">학번</label>
+          <input type="text" id="studentId" inputmode="numeric" placeholder="예: 10101" maxlength="6" required />
+        </div>
+        <div class="field">
+          <label for="name">이름</label>
+          <input type="text" id="name" placeholder="예: 홍길동" maxlength="20" required />
+        </div>
+      </div>
+
+      <div class="field">
+        <label>제출 파일</label>
+        <div id="drop" class="drop" tabindex="0">
+          <strong>여기를 눌러 파일 선택</strong><br />또는 파일을 끌어다 놓으세요
+        </div>
+        <input type="file" id="fileInput" multiple hidden />
+        <ul id="fileList" class="files"></ul>
+        <div class="hint" id="limitHint"></div>
+      </div>
+
+      <div id="preview" class="preview hidden"></div>
+
+      <button type="submit" id="submitBtn" class="primary block">제출하기</button>
+    </form>
+
+    <div id="done" class="card done hidden">
+      <div class="icon">✅</div>
+      <h2>제출 완료!</h2>
+      <p id="doneMsg"></p>
+      <ul id="doneFiles" class="files" style="text-align:left"></ul>
+      <button id="againBtn" style="margin-top:14px">다른 파일 제출하기</button>
+    </div>
+
+    <footer><a href="admin.html">선생님 관리 페이지</a></footer>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="common.js"></script>
+  <script>
+    const MAX_FILES = CFG.MAX_FILES || 5;
+    const MAX_MB = CFG.MAX_TOTAL_MB || 25;
+    let assignments = [];
+    let files = [];
+
+    const sel = $('#assignment');
+    const sidEl = $('#studentId');
+    const nameEl = $('#name');
+    const fileInput = $('#fileInput');
+    const drop = $('#drop');
+
+    $('#limitHint').textContent = `최대 ${MAX_FILES}개, 합계 ${MAX_MB}MB까지. 다시 제출하면 이전 파일은 새 파일로 바뀝니다.`;
+
+    async function loadAssignments() {
+      if (!isConfigured()) {
+        $('#setupAlert').classList.remove('hidden');
+        sel.innerHTML = '<option value="">설정 필요</option>';
+        return;
+      }
+      try {
+        const data = await apiGet({ action: 'list' });
+        assignments = data.assignments;
+        if (assignments.length === 0) {
+          sel.innerHTML = '<option value="">지금 제출 중인 수행평가가 없습니다</option>';
+          return;
+        }
+        sel.innerHTML = '<option value="">수행평가를 고르세요</option>' +
+          assignments.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+        const pre = new URLSearchParams(location.search).get('a');
+        if (pre && assignments.some(a => a.id === pre)) sel.value = pre;
+        else if (assignments.length === 1) sel.value = assignments[0].id;
+        showInfo();
+      } catch (err) {
+        sel.innerHTML = '<option value="">불러오기 실패</option>';
+        toast(err.message, 'error');
+      }
+    }
+
+    function showInfo() {
+      const a = assignments.find(x => x.id === sel.value);
+      const box = $('#assignmentInfo');
+      if (!a) { box.innerHTML = ''; return; }
+      let html = '';
+      if (a.deadline) html += `<div class="hint">마감: <b>${esc(fmtDate(a.deadline))}</b></div>`;
+      if (a.note) html += `<div class="note">${esc(a.note)}</div>`;
+      box.innerHTML = html;
+      updatePreview();
+    }
+
+    function cleanName(v) { return v.replace(/\s+/g, ''); }
+
+    function updatePreview() {
+      const sid = sidEl.value.trim();
+      const nm = cleanName(nameEl.value);
+      const box = $('#preview');
+      if (!sid || !nm || files.length === 0) { box.classList.add('hidden'); return; }
+      const names = files.map((f, i) => {
+        const m = f.name.match(/\.([A-Za-z0-9]{1,10})$/);
+        const ext = m ? '.' + m[1].toLowerCase() : '';
+        return `${sid}_${nm}${files.length > 1 ? '_' + (i + 1) : ''}${ext}`;
+      });
+      box.innerHTML = '이렇게 저장됩니다: ' + names.map(n => `<code>${esc(n)}</code>`).join(', ');
+      box.classList.remove('hidden');
+    }
+
+    function addFiles(list) {
+      for (const f of list) {
+        if (files.length >= MAX_FILES) { toast(`파일은 최대 ${MAX_FILES}개까지예요.`, 'error'); break; }
+        if (f.size === 0) { toast(`빈 파일은 올릴 수 없어요: ${f.name}`, 'error'); continue; }
+        files.push(f);
+      }
+      renderFiles();
+    }
+
+    function renderFiles() {
+      $('#fileList').innerHTML = files.map((f, i) =>
+        `<li><span class="n">📄 ${esc(f.name)}</span><span class="s">${fmtSize(f.size)}</span>
+         <button type="button" data-i="${i}" aria-label="삭제">✕</button></li>`).join('');
+      updatePreview();
+    }
+
+    $('#fileList').addEventListener('click', e => {
+      const i = e.target.dataset.i;
+      if (i !== undefined) { files.splice(Number(i), 1); renderFiles(); }
+    });
+    drop.addEventListener('click', () => fileInput.click());
+    drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
+    fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
+    ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+    ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+    drop.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+    sel.addEventListener('change', showInfo);
+    sidEl.addEventListener('input', () => { sidEl.value = sidEl.value.replace(/\D/g, ''); updatePreview(); });
+    nameEl.addEventListener('input', updatePreview);
+
+    function readBase64(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result).split(',')[1] || '');
+        r.onerror = () => reject(new Error('파일을 읽지 못했습니다: ' + file.name));
+        r.readAsDataURL(file);
+      });
+    }
+
+    $('#form').addEventListener('submit', async e => {
+      e.preventDefault();
+      const sid = sidEl.value.trim();
+      const nm = cleanName(nameEl.value);
+      const a = assignments.find(x => x.id === sel.value);
+      if (!a) return toast('수행평가를 골라 주세요.', 'error');
+      if (!/^\d{4,6}$/.test(sid)) return toast('학번은 숫자 4~6자리로 입력하세요.', 'error');
+      if (!/^[가-힣a-zA-Z]{1,20}$/.test(nm)) return toast('이름은 한글 또는 영문으로만 입력하세요.', 'error');
+      if (files.length === 0) return toast('제출할 파일을 첨부하세요.', 'error');
+      const total = files.reduce((s, f) => s + f.size, 0);
+      if (total > MAX_MB * 1024 * 1024) return toast(`합계 ${MAX_MB}MB를 넘었어요. (현재 ${fmtSize(total)})`, 'error');
+      if (!confirm(`[${a.name}]\n학번 ${sid} / 이름 ${nm}\n\n이 정보로 제출할까요?`)) return;
+
+      const btn = $('#submitBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> 올리는 중… 창을 닫지 마세요';
+      try {
+        const payload = [];
+        for (const f of files) payload.push({ name: f.name, mimeType: f.type, data: await readBase64(f) });
+        const res = await apiPost({ action: 'submit', assignmentId: a.id, studentId: sid, name: nm, files: payload });
+        $('#doneMsg').textContent = `${res.assignment} · ${sid} ${nm}`;
+        $('#doneFiles').innerHTML = res.saved.map(n => `<li><span class="n">📁 ${esc(n)}</span></li>`).join('');
+        $('#form').classList.add('hidden');
+        $('#done').classList.remove('hidden');
+        window.scrollTo(0, 0);
+      } catch (err) {
+        toast(err.message || '제출에 실패했습니다. 다시 시도해 주세요.', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '제출하기';
+      }
+    });
+
+    $('#againBtn').addEventListener('click', () => {
+      files = [];
+      renderFiles();
+      $('#done').classList.add('hidden');
+      $('#form').classList.remove('hidden');
+    });
+
+    loadAssignments();
+  </script>
+</body>
+</html>

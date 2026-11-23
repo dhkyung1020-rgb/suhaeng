@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>수행평가 제출함 · 관리</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="admin">
+  <div class="wrap wide">
+    <header class="top">
+      <div class="row">
+        <div>
+          <h1><span data-title>수행평가 제출함</span> · 관리</h1>
+          <p>수행평가를 만들면 구글 드라이브에 폴더가 생기고, 학생 제출물이 그 안에 쌓입니다.</p>
+        </div>
+        <div id="topActions" class="hidden" style="display:flex;gap:8px">
+          <button id="refreshBtn">새로고침</button>
+          <button id="newBtn" class="primary">+ 새 수행평가</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="setupAlert" class="alert hidden">config.js에 Apps Script 웹 앱 URL이 아직 설정되지 않았습니다.</div>
+
+    <form id="loginForm" class="card" style="max-width:420px">
+      <h2>관리자 로그인</h2>
+      <div class="field">
+        <label for="pw">관리자 비밀번호</label>
+        <input type="password" id="pw" required autocomplete="current-password" />
+        <div class="hint">Apps Script에서 setup()을 실행하면 실행 로그에 표시됩니다.</div>
+      </div>
+      <button class="primary block" id="loginBtn">로그인</button>
+    </form>
+
+    <div id="main" class="card hidden">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>수행평가</th><th>상태</th><th>마감</th><th>제출 파일</th><th></th></tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="emptyRows" class="empty hidden">아직 수행평가가 없습니다. 오른쪽 위 <b>+ 새 수행평가</b>를 눌러 만드세요.</div>
+    </div>
+
+    <footer><a href="index.html">학생 제출 페이지로</a></footer>
+  </div>
+
+  <!-- 만들기/수정 -->
+  <dialog id="editDlg">
+    <form id="editForm" method="dialog">
+      <div class="dh"><h3 id="editTitle">새 수행평가</h3><button type="button" class="sm" data-close>닫기</button></div>
+      <div class="db">
+        <div class="field">
+          <label for="eName">이름 (드라이브 폴더 이름)</label>
+          <input type="text" id="eName" placeholder="예: 2학년 국어 독서감상문" required />
+        </div>
+        <div class="field">
+          <label for="eDeadline">마감 일시 (선택)</label>
+          <input type="datetime-local" id="eDeadline" />
+          <div class="hint">비워 두면 직접 '마감'을 누를 때까지 계속 받습니다.</div>
+        </div>
+        <div class="field">
+          <label for="eNote">학생 안내 문구 (선택)</label>
+          <textarea id="eNote" rows="3" placeholder="예: PDF 또는 HWP로 제출. 표지에 학번·이름 필수."></textarea>
+        </div>
+      </div>
+      <div class="df">
+        <button type="button" data-close>취소</button>
+        <button type="submit" class="primary" id="saveBtn">저장</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 제출 현황 -->
+  <dialog id="filesDlg">
+    <div class="dh"><h3 id="filesTitle">제출 현황</h3><button type="button" class="sm" data-close>닫기</button></div>
+    <div class="db">
+      <div id="filesBody"></div>
+      <details style="margin-top:18px">
+        <summary style="cursor:pointer;font-weight:600">미제출자 확인하기</summary>
+        <div class="field" style="margin-top:10px">
+          <textarea id="roster" rows="5" placeholder="반 학번 목록을 붙여넣으세요 (줄바꿈·쉼표·공백으로 구분)&#10;예: 10101 10102 10103"></textarea>
+          <div class="hint">입력한 목록은 이 브라우저에만 저장됩니다.</div>
+        </div>
+        <div id="missing"></div>
+      </details>
+    </div>
+    <div class="df"><a class="btn" id="filesDriveLink" target="_blank" rel="noopener">드라이브에서 열기</a></div>
+  </dialog>
+
+  <script src="config.js"></script>
+  <script src="common.js"></script>
+  <script>
+    let password = sessionStorage.getItem('adminPw') || '';
+    let assignments = [];
+    let editingId = null;
+    let currentFiles = [];
+
+    function admin(action, extra) {
+      return apiPost(Object.assign({ action, password }, extra || {}));
+    }
+
+    async function login(pw) {
+      password = pw;
+      await admin('admin.login');
+      sessionStorage.setItem('adminPw', pw);
+      $('#loginForm').classList.add('hidden');
+      $('#main').classList.remove('hidden');
+      $('#topActions').classList.remove('hidden');
+      await refresh();
+    }
+
+    $('#loginForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const btn = $('#loginBtn');
+      btn.disabled = true;
+      try { await login($('#pw').value); }
+      catch (err) { toast(err.message, 'error'); sessionStorage.removeItem('adminPw'); }
+      finally { btn.disabled = false; }
+    });
+
+    async function refresh() {
+      $('#rows').innerHTML = '<tr><td colspan="5" class="empty">불러오는 중…</td></tr>';
+      try {
+        const data = await admin('admin.list');
+        assignments = data.assignments;
+        render();
+      } catch (err) {
+        toast(err.message, 'error');
+      }
+    }
+
+    function studentLink(id) {
+      return new URL('index.html', location.href).href + '?a=' + encodeURIComponent(id);
+    }
+
+    function render() {
+      $('#emptyRows').classList.toggle('hidden', assignments.length > 0);
+      $('#rows').innerHTML = assignments.map(a => {
+        const status = a.accepting
+          ? '<span class="badge on">제출 중</span>'
+          : `<span class="badge off">${a.open ? '기한 지남' : '마감'}</span>`;
+        return `<tr>
+          <td><b>${esc(a.name)}</b>${a.note ? `<div class="hint" style="margin:2px 0 0">${esc(a.note).slice(0, 60)}</div>` : ''}</td>
+          <td>${status}</td>
+          <td>${a.deadline ? esc(fmtDate(a.deadline)) : '<span class="hint">없음</span>'}</td>
+          <td><button class="sm" data-act="files" data-id="${a.id}">${a.fileCount}개 보기</button></td>
+          <td><div class="actions">
+            <button class="sm" data-act="link" data-id="${a.id}">학생 링크 복사</button>
+            <button class="sm" data-act="toggle" data-id="${a.id}">${a.open ? '마감하기' : '다시 열기'}</button>
+            <button class="sm" data-act="edit" data-id="${a.id}">수정</button>
+            <a class="btn sm" href="${esc(a.url)}" target="_blank" rel="noopener">폴더</a>
+          </div></td>
+        </tr>`;
+      }).join('');
+    }
+
+    $('#rows').addEventListener('click', async e => {
+      const b = e.target.closest('button[data-act]');
+      if (!b) return;
+      const a = assignments.find(x => x.id === b.dataset.id);
+      if (!a) return;
+      const act = b.dataset.act;
+      if (act === 'link') {
+        try { await navigator.clipboard.writeText(studentLink(a.id)); toast('학생용 링크를 복사했어요.'); }
+        catch (_) { prompt('아래 링크를 복사하세요', studentLink(a.id)); }
+      } else if (act === 'toggle') {
+        b.disabled = true;
+        try {
+          const patch = { assignmentId: a.id, open: !a.open };
+          if (!a.open && a.deadline && new Date(a.deadline) < new Date()) {
+            if (!confirm('마감 일시가 이미 지났습니다. 마감 일시를 지우고 다시 열까요?')) { b.disabled = false; return; }
+            patch.deadline = '';
+          }
+          await admin('admin.update', patch);
+          toast(a.open ? '마감했습니다.' : '다시 열었습니다.');
+          await refresh();
+        } catch (err) { toast(err.message, 'error'); b.disabled = false; }
+      } else if (act === 'edit') {
+        openEdit(a);
+      } else if (act === 'files') {
+        openFiles(a);
+      }
+    });
+
+    // 만들기/수정
+    function toLocalInput(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    function openEdit(a) {
+      editingId = a ? a.id : null;
+      $('#editTitle').textContent = a ? '수행평가 수정' : '새 수행평가';
+      $('#eName').value = a ? a.name : '';
+      $('#eDeadline').value = a ? toLocalInput(a.deadline) : '';
+      $('#eNote').value = a ? a.note : '';
+      $('#editDlg').showModal();
+    }
+
+    $('#newBtn').addEventListener('click', () => openEdit(null));
+    $('#refreshBtn').addEventListener('click', refresh);
+
+    $('#editForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const btn = $('#saveBtn');
+      const dl = $('#eDeadline').value;
+      const body = {
+        name: $('#eName').value.trim(),
+        deadline: dl ? new Date(dl).toISOString() : '',
+        note: $('#eNote').value.trim(),
+      };
+      btn.disabled = true;
+      try {
+        if (editingId) await admin('admin.update', Object.assign({ assignmentId: editingId }, body));
+        else await admin('admin.create', body);
+        $('#editDlg').close();
+        toast(editingId ? '저장했습니다.' : '드라이브에 폴더를 만들었습니다.');
+        await refresh();
+      } catch (err) { toast(err.message, 'error'); }
+      finally { btn.disabled = false; }
+    });
+
+    // 제출 현황
+    async function openFiles(a) {
+      $('#filesTitle').textContent = a.name + ' · 제출 현황';
+      $('#filesDriveLink').href = a.url;
+      $('#filesBody').innerHTML = '<div class="empty">불러오는 중…</div>';
+      $('#missing').innerHTML = '';
+      $('#roster').value = localStorage.getItem('roster') || '';
+      $('#filesDlg').showModal();
+      try {
+        const data = await admin('admin.files', { assignmentId: a.id });
+        currentFiles = data.files;
+        const ids = new Set(currentFiles.map(f => f.studentId).filter(Boolean));
+        $('#filesBody').innerHTML = currentFiles.length === 0
+          ? '<div class="empty">아직 제출한 학생이 없습니다.</div>'
+          : `<p class="hint" style="margin-top:0">제출 학생 <b>${ids.size}명</b> · 파일 ${currentFiles.length}개</p>
+             <div class="table-wrap"><table><thead><tr><th>학번</th><th>이름</th><th>파일</th><th>제출 시각</th></tr></thead><tbody>
+             ${currentFiles.map(f => `<tr><td>${esc(f.studentId)}</td><td>${esc(f.studentName)}</td>
+               <td><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.fileName)}</a> <span class="hint">${fmtSize(f.size)}</span></td>
+               <td>${esc(fmtDate(f.updated))}</td></tr>`).join('')}
+             </tbody></table></div>`;
+        checkMissing();
+      } catch (err) {
+        $('#filesBody').innerHTML = `<div class="alert">${esc(err.message)}</div>`;
+      }
+    }
+
+    function checkMissing() {
+      const raw = $('#roster').value;
+      localStorage.setItem('roster', raw);
+      const roster = [...new Set(raw.split(/[\s,]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s)))];
+      if (roster.length === 0) { $('#missing').innerHTML = ''; return; }
+      const submitted = new Set(currentFiles.map(f => f.studentId));
+      const missing = roster.filter(id => !submitted.has(id));
+      $('#missing').innerHTML = missing.length === 0
+        ? '<div class="preview">🎉 명단의 모든 학생이 제출했습니다.</div>'
+        : `<div class="alert">미제출 ${missing.length}명 / ${roster.length}명<br><b>${missing.join(', ')}</b></div>`;
+    }
+    $('#roster').addEventListener('input', checkMissing);
+
+    document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
+
+    // 시작
+    if (!isConfigured()) {
+      $('#setupAlert').classList.remove('hidden');
+    } else if (password) {
+      login(password).catch(() => { sessionStorage.removeItem('adminPw'); password = ''; });
+    }
+  </script>
+</body>
+</html>
