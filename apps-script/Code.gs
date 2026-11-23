@@ -1,15 +1,9 @@
 /**
  * 수행평가 제출함 — Google Apps Script 백엔드
  *
- * 구조
- *   내 드라이브/수행평가 제출함/          ← 루트 폴더 (setup()이 자동 생성)
- *     ├─ 제출기록 (스프레드시트)          ← 모든 제출 로그
- *     ├─ 1학기 국어 독서감상문/           ← 수행평가 1개 = 하위 폴더 1개
- *     │    ├─ 10101_홍길동.pdf
- *     │    └─ 10102_김철수.hwp
- *     └─ 2학기 과학 탐구보고서/
- *
- * 관리자 페이지에서 수행평가를 만들면 기준 폴더 안에 하위 폴더가 생기고 바로 학생 화면에 나타납니다.
+ * 기준 폴더(CONFIG.ROOT_FOLDER_ID) 안의 하위 폴더 1개 = 수행평가 1개.
+ * 학생 파일은 '학번_이름.확장자'로 해당 폴더에 저장되고, 모든 제출은 '수행평가 제출기록' 시트에 남습니다.
+ * 관리자 페이지에서 수행평가를 만들면 하위 폴더가 생기고 바로 학생 화면에 나타납니다.
  * 드라이브에서 직접 만든 폴더는 관리자 페이지에서 '다시 열기'를 눌러야 학생에게 보입니다.
  */
 
@@ -17,7 +11,7 @@
 const CONFIG = {
   ROOT_FOLDER_ID: '1KRtCgOHfaD10E8AZOPcWtkLdrgvC_wgb',                // 기준 폴더 ID (비우면 setup()이 '수행평가 제출함' 폴더를 새로 만듦)
   ROOT_FOLDER_NAME: '수행평가 제출함',
-  MAX_TOTAL_MB: 25,                    // 한 번에 올릴 수 있는 총 용량 (Apps Script 요청 한도 때문에 30MB 이하 권장)
+  MAX_FILE_MB: 2048,                   // 파일 1개 최대 용량 (MB). 학생 브라우저가 드라이브로 직접 올리므로 영상도 가능
   MAX_FILES: 5,                        // 한 번에 올릴 수 있는 파일 수
   STUDENT_ID_PATTERN: /^\d{4,6}$/,     // 학번 형식 (예: 10101, 30215)
   NAME_PATTERN: /^[가-힣a-zA-Z]{1,20}$/,
@@ -32,6 +26,7 @@ const PROPS = PropertiesService.getScriptProperties();
  * 실행 후 [실행 로그]에서 관리자 비밀번호를 확인하세요.
  */
 function setup() {
+  ScriptApp.getOAuthToken(); // 드라이브 직접 업로드 권한 확인용
   const root = getRoot_(true);
   if (!PROPS.getProperty('ADMIN_PASSWORD')) {
     PROPS.setProperty('ADMIN_PASSWORD', Utilities.getUuid().replace(/-/g, '').slice(0, 10));
@@ -57,7 +52,8 @@ function doPost(e) {
     if (!e || !e.postData || !e.postData.contents) throw new Error('요청 내용이 비어 있습니다.');
     const d = JSON.parse(e.postData.contents);
     switch (d.action) {
-      case 'submit':       return submit_(d);
+      case 'upload.start':  return startUpload_(d);
+      case 'upload.finish': return finishUpload_(d);
       case 'admin.login':  requireAdmin_(d); return {};
       case 'admin.list':   requireAdmin_(d); return { assignments: listAssignments_(true) };
       case 'admin.create': requireAdmin_(d); return { assignment: createAssignment_(d) };
@@ -79,46 +75,90 @@ function respond_(fn) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-/***** 학생 제출 *****/
-function submit_(d) {
+/***** 학생 제출 *****
+ * 1) upload.start  : 서버가 파일마다 드라이브 '재개 가능 업로드' 주소를 발급
+ * 2) 브라우저가 그 주소로 파일을 조각내어 드라이브에 직접 업로드 (Apps Script 용량 한도와 무관)
+ * 3) upload.finish : 서버가 파일을 확인하고, 재제출이면 이전 파일을 휴지통으로 옮긴 뒤 기록
+ */
+function checkStudent_(d) {
   const studentId = String(d.studentId || '').trim();
   const name = String(d.name || '').replace(/\s+/g, '');
-  const files = Array.isArray(d.files) ? d.files : [];
-
   if (!CONFIG.STUDENT_ID_PATTERN.test(studentId)) throw new Error('학번 형식이 올바르지 않습니다.');
   if (!CONFIG.NAME_PATTERN.test(name)) throw new Error('이름은 한글 또는 영문으로만 입력하세요.');
+  return { studentId, name, base: studentId + '_' + name };
+}
+
+function startUpload_(d) {
+  const st = checkStudent_(d);
+  const files = Array.isArray(d.files) ? d.files : [];
   if (files.length === 0) throw new Error('제출할 파일을 첨부하세요.');
   if (files.length > CONFIG.MAX_FILES) throw new Error('파일은 최대 ' + CONFIG.MAX_FILES + '개까지 올릴 수 있습니다.');
-
-  const totalBytes = files.reduce((s, f) => s + Math.floor(String(f.data || '').length * 3 / 4), 0);
-  if (totalBytes > CONFIG.MAX_TOTAL_MB * 1024 * 1024) throw new Error('총 용량이 ' + CONFIG.MAX_TOTAL_MB + 'MB를 넘습니다.');
+  files.forEach(f => {
+    const size = Number(f.size);
+    if (!(size > 0)) throw new Error('빈 파일은 제출할 수 없습니다: ' + f.name);
+    if (size > CONFIG.MAX_FILE_MB * 1024 * 1024) throw new Error('파일 하나는 ' + CONFIG.MAX_FILE_MB + 'MB까지 올릴 수 있습니다: ' + f.name);
+  });
 
   const folder = getAssignmentFolder_(d.assignmentId);
-  const meta = readMeta_(folder);
-  if (!isAccepting_(meta)) throw new Error('제출이 마감된 수행평가입니다.');
+  if (!isAccepting_(readMeta_(folder))) throw new Error('제출이 마감된 수행평가입니다.');
 
-  const base = studentId + '_' + name;
-  const saved = [];
+  const token = ScriptApp.getOAuthToken();
+  const origin = String(d.origin || '');
+  const uploads = files.map((f, i) => {
+    const fileName = (files.length > 1 ? st.base + '_' + (i + 1) : st.base) + extOf_(f.name);
+    const mimeType = String(f.mimeType || '') || 'application/octet-stream';
+    const headers = {
+      Authorization: 'Bearer ' + token,
+      'X-Upload-Content-Type': mimeType,
+      'X-Upload-Content-Length': String(Math.floor(Number(f.size))),
+    };
+    if (origin) headers.Origin = origin; // 브라우저에서 직접 업로드하려면 필요(CORS)
+    const res = UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name', {
+      method: 'post',
+      contentType: 'application/json; charset=UTF-8',
+      headers: headers,
+      payload: JSON.stringify({ name: fileName, parents: [folder.getId()], mimeType: mimeType }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) throw new Error('업로드 준비에 실패했습니다. (' + res.getResponseCode() + ')');
+    const h = res.getAllHeaders();
+    const url = h.Location || h.location;
+    if (!url) throw new Error('업로드 주소를 받지 못했습니다.');
+    return { fileName: fileName, uploadUrl: url };
+  });
+  return { uploads: uploads, maxFileMb: CONFIG.MAX_FILE_MB };
+}
+
+function finishUpload_(d) {
+  const st = checkStudent_(d);
+  const ids = Array.isArray(d.fileIds) ? d.fileIds.map(String) : [];
+  if (ids.length === 0) throw new Error('업로드된 파일이 없습니다.');
+  const folder = getAssignmentFolder_(d.assignmentId);
+  const folderId = folder.getId();
+
+  const saved = ids.map(id => {
+    const f = DriveApp.getFileById(id);
+    let inFolder = false;
+    const ps = f.getParents();
+    while (ps.hasNext()) if (ps.next().getId() === folderId) inFolder = true;
+    if (!inFolder || f.getName().indexOf(st.base) !== 0) throw new Error('업로드한 파일을 확인할 수 없습니다.');
+    return f;
+  });
+
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
     if (CONFIG.OVERWRITE_ON_RESUBMIT) {
+      const keep = {};
+      ids.forEach(id => (keep[id] = true));
       const it = folder.getFiles();
       while (it.hasNext()) {
         const f = it.next();
         const n = f.getName();
-        if (n === base || n.indexOf(base + '.') === 0 || n.indexOf(base + '_') === 0) f.setTrashed(true);
+        if (keep[f.getId()]) continue;
+        if (n === st.base || n.indexOf(st.base + '.') === 0 || n.indexOf(st.base + '_') === 0) f.setTrashed(true);
       }
     }
-    files.forEach((f, i) => {
-      const ext = extOf_(f.name);
-      const fileName = (files.length > 1 ? base + '_' + (i + 1) : base) + ext;
-      const bytes = Utilities.base64Decode(String(f.data || ''));
-      if (bytes.length === 0) throw new Error('빈 파일은 제출할 수 없습니다: ' + f.name);
-      const blob = Utilities.newBlob(bytes, f.mimeType || 'application/octet-stream', fileName);
-      const created = folder.createFile(blob);
-      saved.push({ name: fileName, url: created.getUrl() });
-    });
   } finally {
     lock.releaseLock();
   }
@@ -126,12 +166,11 @@ function submit_(d) {
   try {
     const sheet = getLogSheet_();
     const now = new Date();
-    saved.forEach(s => sheet.appendRow([now, folder.getName(), "'" + studentId, name, s.name, s.url]));
+    saved.forEach(f => sheet.appendRow([now, folder.getName(), "'" + st.studentId, st.name, f.getName(), f.getUrl()]));
   } catch (err) {
     console.warn('로그 기록 실패: ' + err);
   }
-
-  return { saved: saved.map(s => s.name), assignment: folder.getName() };
+  return { saved: saved.map(f => f.getName()), assignment: folder.getName() };
 }
 
 function extOf_(fileName) {
