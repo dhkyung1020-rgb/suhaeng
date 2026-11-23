@@ -100,3 +100,7 @@ dialog .df { padding: 14px 22px; border-top: 1px solid var(--line); display: fle
 .hidden { display: none !important; }
 footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 30px; }
 footer a { color: var(--muted); }
+
+.progress { margin-bottom: 18px; }
+.progress .bar { height: 10px; background: var(--accent-soft); border-radius: 999px; overflow: hidden; }
+.progress .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }

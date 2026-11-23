@@ -48,6 +48,11 @@
 
       <div id="preview" class="preview hidden"></div>
 
+      <div id="progress" class="progress hidden">
+        <div class="bar"><span id="progressBar"></span></div>
+        <div class="hint" id="progressText"></div>
+      </div>
+
       <button type="submit" id="submitBtn" class="primary block">제출하기</button>
     </form>
 
@@ -62,11 +67,12 @@
     <footer><a href="admin.html">선생님 관리 페이지</a></footer>
   </div>
 
-  <script src="config.js"></script>
-  <script src="common.js"></script>
+  <script src="config.js?v=2"></script>
+  <script src="common.js?v=2"></script>
   <script>
     const MAX_FILES = CFG.MAX_FILES || 5;
-    const MAX_MB = CFG.MAX_TOTAL_MB || 25;
+    const MAX_FILE_MB = CFG.MAX_FILE_MB || 2048;
+    const CHUNK = 16 * 1024 * 1024; // 16MB 단위로 나눠 올림 (256KB의 배수여야 함)
     let assignments = [];
     let files = [];
 
@@ -76,7 +82,7 @@
     const fileInput = $('#fileInput');
     const drop = $('#drop');
 
-    $('#limitHint').textContent = `최대 ${MAX_FILES}개, 합계 ${MAX_MB}MB까지. 다시 제출하면 이전 파일은 새 파일로 바뀝니다.`;
+    $('#limitHint').textContent = `최대 ${MAX_FILES}개, 파일 하나당 ${MAX_FILE_MB >= 1024 ? (MAX_FILE_MB / 1024) + 'GB' : MAX_FILE_MB + 'MB'}까지 (영상 가능). 다시 제출하면 이전 파일은 새 파일로 바뀝니다.`;
 
     async function loadAssignments() {
       if (!isConfigured()) {
@@ -134,6 +140,7 @@
       for (const f of list) {
         if (files.length >= MAX_FILES) { toast(`파일은 최대 ${MAX_FILES}개까지예요.`, 'error'); break; }
         if (f.size === 0) { toast(`빈 파일은 올릴 수 없어요: ${f.name}`, 'error'); continue; }
+        if (f.size > MAX_FILE_MB * 1024 * 1024) { toast(`파일이 너무 커요 (최대 ${MAX_FILE_MB}MB): ${f.name}`, 'error'); continue; }
         files.push(f);
       }
       renderFiles();
@@ -160,13 +167,43 @@
     sidEl.addEventListener('input', () => { sidEl.value = sidEl.value.replace(/\D/g, ''); updatePreview(); });
     nameEl.addEventListener('input', updatePreview);
 
-    function readBase64(file) {
+    // 드라이브 업로드 주소로 조각 하나를 보냄
+    function putChunk(url, blob, start, total, onProgress) {
       return new Promise((resolve, reject) => {
-        const r = new FileReader();
-        r.onload = () => resolve(String(r.result).split(',')[1] || '');
-        r.onerror = () => reject(new Error('파일을 읽지 못했습니다: ' + file.name));
-        r.readAsDataURL(file);
+        const x = new XMLHttpRequest();
+        x.open('PUT', url);
+        x.setRequestHeader('Content-Range', `bytes ${start}-${start + blob.size - 1}/${total}`);
+        x.upload.onprogress = e => onProgress(e.loaded);
+        x.onload = () => resolve({ status: x.status, body: x.responseText });
+        x.onerror = () => reject(new Error('network'));
+        x.send(blob);
       });
+    }
+
+    async function uploadFile(file, url, onProgress) {
+      let start = 0;
+      while (true) {
+        const end = Math.min(start + CHUNK, file.size);
+        let res, tries = 0;
+        while (true) {
+          try { res = await putChunk(url, file.slice(start, end), start, file.size, n => onProgress(start + n)); }
+          catch (e) { res = null; }
+          if (res && (res.status === 200 || res.status === 201 || res.status === 308)) break;
+          if (++tries >= 4) throw new Error('업로드가 끊겼습니다. 인터넷 연결을 확인하고 다시 제출해 주세요.');
+          await new Promise(r => setTimeout(r, 1500 * tries));
+        }
+        if (res.status === 308) { start = end; continue; }
+        const data = JSON.parse(res.body || '{}');
+        if (!data.id) throw new Error('업로드 결과를 확인하지 못했습니다.');
+        return data.id;
+      }
+    }
+
+    function showProgress(done, total, label) {
+      const pct = total ? Math.min(100, Math.floor(done / total * 100)) : 0;
+      $('#progress').classList.remove('hidden');
+      $('#progressBar').style.width = pct + '%';
+      $('#progressText').textContent = `${label} · ${fmtSize(done)} / ${fmtSize(total)} (${pct}%)`;
     }
 
     $('#form').addEventListener('submit', async e => {
@@ -178,17 +215,31 @@
       if (!/^\d{4,6}$/.test(sid)) return toast('학번은 숫자 4~6자리로 입력하세요.', 'error');
       if (!/^[가-힣a-zA-Z]{1,20}$/.test(nm)) return toast('이름은 한글 또는 영문으로만 입력하세요.', 'error');
       if (files.length === 0) return toast('제출할 파일을 첨부하세요.', 'error');
-      const total = files.reduce((s, f) => s + f.size, 0);
-      if (total > MAX_MB * 1024 * 1024) return toast(`합계 ${MAX_MB}MB를 넘었어요. (현재 ${fmtSize(total)})`, 'error');
       if (!confirm(`[${a.name}]\n학번 ${sid} / 이름 ${nm}\n\n이 정보로 제출할까요?`)) return;
 
       const btn = $('#submitBtn');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> 올리는 중… 창을 닫지 마세요';
+      const total = files.reduce((s, f) => s + f.size, 0);
+      const leave = ev => { ev.preventDefault(); ev.returnValue = ''; };
+      window.addEventListener('beforeunload', leave);
       try {
-        const payload = [];
-        for (const f of files) payload.push({ name: f.name, mimeType: f.type, data: await readBase64(f) });
-        const res = await apiPost({ action: 'submit', assignmentId: a.id, studentId: sid, name: nm, files: payload });
+        showProgress(0, total, '업로드 준비 중');
+        const base = { assignmentId: a.id, studentId: sid, name: nm };
+        const start = await apiPost(Object.assign({
+          action: 'upload.start', origin: location.origin,
+          files: files.map(f => ({ name: f.name, mimeType: f.type, size: f.size })),
+        }, base));
+        const ids = [];
+        let doneBefore = 0;
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          const label = files.length > 1 ? `${i + 1}/${files.length}번째 파일 올리는 중` : '올리는 중';
+          ids.push(await uploadFile(f, start.uploads[i].uploadUrl, n => showProgress(doneBefore + n, total, label)));
+          doneBefore += f.size;
+        }
+        showProgress(total, total, '마무리 중');
+        const res = await apiPost(Object.assign({ action: 'upload.finish', fileIds: ids }, base));
         $('#doneMsg').textContent = `${res.assignment} · ${sid} ${nm}`;
         $('#doneFiles').innerHTML = res.saved.map(n => `<li><span class="n">📁 ${esc(n)}</span></li>`).join('');
         $('#form').classList.add('hidden');
@@ -197,6 +248,8 @@
       } catch (err) {
         toast(err.message || '제출에 실패했습니다. 다시 시도해 주세요.', 'error');
       } finally {
+        window.removeEventListener('beforeunload', leave);
+        $('#progress').classList.add('hidden');
         btn.disabled = false;
         btn.textContent = '제출하기';
       }
